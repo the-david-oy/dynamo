@@ -156,6 +156,7 @@ runs:
         DOCKER_ENV_FLAGS=()
         if [[ -n "${HF_TOKEN:-}" ]]; then
           DOCKER_ENV_FLAGS+=(--env "HF_TOKEN=${HF_TOKEN}")
+          DOCKER_ENV_FLAGS+=(--env "DYN_HF_GATED_MODELS_ENABLED=1")
         fi
         DOCKER_ENV_FLAGS+=(--env "DYNAMO_TEST_FRAMEWORK=${{ inputs.framework }}")
         DOCKER_ENV_FLAGS+=(--env "DYNAMO_TEST_PLATFORM=${{ inputs.platform_arch }}")
@@ -258,6 +259,7 @@ runs:
         DOCKER_ENV_FLAGS=()
         if [[ -n "${HF_TOKEN:-}" ]]; then
           DOCKER_ENV_FLAGS+=(--env "HF_TOKEN=${HF_TOKEN}")
+          DOCKER_ENV_FLAGS+=(--env "DYN_HF_GATED_MODELS_ENABLED=1")
         fi
         DOCKER_ENV_FLAGS+=(--env "HF_XET_HIGH_PERFORMANCE=1")
         DOCKER_ENV_FLAGS+=(--env "DYNAMO_TEST_FRAMEWORK=${{ inputs.framework }}")
