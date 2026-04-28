@@ -60,10 +60,11 @@ use crate::protocols::openai::{
 use crate::protocols::unified::UnifiedRequest;
 use crate::request_template::RequestTemplate;
 use crate::types::Annotated;
-use dynamo_runtime::logging::get_distributed_tracing_context;
+use dynamo_runtime::logging::{
+    DEPRECATED_DYNAMO_REQUEST_ID_HEADER, REQUEST_ID_HEADER, X_REQUEST_ID_HEADER,
+    get_distributed_tracing_context,
+};
 use tracing::Instrument;
-
-pub const DYNAMO_REQUEST_ID_HEADER: &str = "x-dynamo-request-id";
 
 /// Dynamo Annotation for the request ID
 pub const ANNOTATION_REQUEST_ID: &str = "request_id";
@@ -330,42 +331,13 @@ pub async fn smart_json_error_middleware(request: Request<Body>, next: Next) -> 
 ///
 /// The canonical request ID is set by `make_inference_request_span()` and stored
 /// in the `DistributedTraceContext` via `DistributedTraceIdLayer`. This function
-/// retrieves it, falling back to a validated `x-dynamo-request-id` header value
-/// (deprecated, DEP #7812) or a new UUID.
+/// retrieves it, falling back to a validated `request-id` header value, a
+/// validated `x-dynamo-request-id` header value (deprecated, DEP #7812), or a
+/// new UUID.
 ///
 /// **Deprecation (DEP #7812):** The `x-dynamo-request-id` header is deprecated.
-/// Clients should rely on server-generated request IDs instead of supplying their own.
+/// Clients that need to supply request IDs should use `request-id`.
 pub(super) fn get_or_create_request_id(headers: &HeaderMap) -> String {
-    // Validate x-dynamo-request-id header if present, warn on invalid values.
-    // DEP #7812: x-dynamo-request-id is deprecated — clients should rely on
-    // server-generated request IDs instead of supplying their own.
-    let validated_header = if let Some(raw) = headers.get(DYNAMO_REQUEST_ID_HEADER) {
-        tracing::warn!(
-            "{} header is deprecated (DEP #7812); server-generated request IDs should be used instead",
-            DYNAMO_REQUEST_ID_HEADER
-        );
-        match raw.to_str() {
-            Err(_) => {
-                tracing::warn!(
-                    "{} header must be a valid UTF-8 string",
-                    DYNAMO_REQUEST_ID_HEADER
-                );
-                None
-            }
-            Ok(s) if uuid::Uuid::parse_str(s).is_err() => {
-                tracing::warn!(
-                    "{} header must be a valid UUID, got: {}",
-                    DYNAMO_REQUEST_ID_HEADER,
-                    s
-                );
-                None
-            }
-            Ok(s) => Some(s.to_string()),
-        }
-    } else {
-        None
-    };
-
     // Prefer trace context (set by make_inference_request_span via DistributedTraceIdLayer)
     if let Some(trace_context) = get_distributed_tracing_context()
         && let Some(request_id) = trace_context.request_id
@@ -373,8 +345,47 @@ pub(super) fn get_or_create_request_id(headers: &HeaderMap) -> String {
         return request_id;
     }
 
-    // Fallback: use validated header for backwards compat, or generate new UUID
-    validated_header.unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+    if let Some(request_id) = validated_request_id_header(headers, REQUEST_ID_HEADER) {
+        return request_id;
+    }
+
+    if headers.contains_key(DEPRECATED_DYNAMO_REQUEST_ID_HEADER) {
+        tracing::warn!(
+            "{} header is deprecated (DEP #7812); use {} instead",
+            DEPRECATED_DYNAMO_REQUEST_ID_HEADER,
+            REQUEST_ID_HEADER
+        );
+    }
+
+    validated_request_id_header(headers, DEPRECATED_DYNAMO_REQUEST_ID_HEADER)
+        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string())
+}
+
+fn validated_request_id_header(headers: &HeaderMap, header_name: &str) -> Option<String> {
+    let raw = headers.get(header_name)?;
+    match raw.to_str() {
+        Err(_) => {
+            tracing::warn!("{} header must be a valid UTF-8 string", header_name);
+            None
+        }
+        Ok(s) if uuid::Uuid::parse_str(s).is_err() => {
+            tracing::warn!("{} header must be a valid UUID, got: {}", header_name, s);
+            None
+        }
+        Ok(s) => Some(s.to_string()),
+    }
+}
+
+fn attach_x_request_id<T: Send + Sync + 'static>(request: &mut Context<T>, headers: &HeaderMap) {
+    if let Some(x_request_id) = headers
+        .get(X_REQUEST_ID_HEADER)
+        .and_then(|value| value.to_str().ok())
+    {
+        request.insert(
+            crate::agents::trace::X_REQUEST_ID_CONTEXT_KEY,
+            x_request_id.to_string(),
+        );
+    }
 }
 
 /// OpenAI Completions Request Handler
@@ -403,7 +414,8 @@ async fn handler_completions(
         endpoint: Endpoint::Completions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = Context::with_id(request, request_id);
+    let mut request = Context::with_id(request, request_id);
+    attach_x_request_id(&mut request, &headers);
     let context = request.context();
 
     // create the connection handles
@@ -883,7 +895,8 @@ async fn handler_chat_completions(
         endpoint: Endpoint::ChatCompletions.to_string(),
         request_type: if streaming { "stream" } else { "unary" }.to_string(),
     };
-    let request = Context::with_id(request, request_id);
+    let mut request = Context::with_id(request, request_id);
+    attach_x_request_id(&mut request, &headers);
     let context = request.context();
 
     // create the connection handles
@@ -2602,6 +2615,54 @@ mod tests {
             },
             nvext: None,
         }
+    }
+
+    #[test]
+    fn test_get_or_create_request_id_uses_request_id_header() {
+        let request_id = "b856c851-478c-46f3-86f3-46a6ab704bbb";
+        let mut headers = HeaderMap::new();
+        headers.insert(REQUEST_ID_HEADER, request_id.parse().unwrap());
+
+        assert_eq!(get_or_create_request_id(&headers), request_id);
+    }
+
+    #[test]
+    fn test_get_or_create_request_id_prefers_request_id_over_deprecated_header() {
+        let request_id = "b856c851-478c-46f3-86f3-46a6ab704bbb";
+        let deprecated_request_id = "550e8400-e29b-41d4-a716-446655440000";
+        let mut headers = HeaderMap::new();
+        headers.insert(REQUEST_ID_HEADER, request_id.parse().unwrap());
+        headers.insert(
+            DEPRECATED_DYNAMO_REQUEST_ID_HEADER,
+            deprecated_request_id.parse().unwrap(),
+        );
+
+        assert_eq!(get_or_create_request_id(&headers), request_id);
+    }
+
+    #[test]
+    fn test_get_or_create_request_id_ignores_x_request_id() {
+        let x_request_id = "app-request-1";
+        let mut headers = HeaderMap::new();
+        headers.insert(X_REQUEST_ID_HEADER, x_request_id.parse().unwrap());
+
+        let request_id = get_or_create_request_id(&headers);
+
+        assert_ne!(request_id, x_request_id);
+        assert!(uuid::Uuid::parse_str(&request_id).is_ok());
+    }
+
+    #[test]
+    fn test_get_or_create_request_id_falls_back_to_deprecated_header() {
+        let deprecated_request_id = "550e8400-e29b-41d4-a716-446655440000";
+        let mut headers = HeaderMap::new();
+        headers.insert(REQUEST_ID_HEADER, "not-a-uuid".parse().unwrap());
+        headers.insert(
+            DEPRECATED_DYNAMO_REQUEST_ID_HEADER,
+            deprecated_request_id.parse().unwrap(),
+        );
+
+        assert_eq!(get_or_create_request_id(&headers), deprecated_request_id);
     }
 
     #[test]
