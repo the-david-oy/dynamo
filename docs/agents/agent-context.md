@@ -7,7 +7,8 @@ subtitle: Attach workflow identity to agentic requests
 
 Dynamo supports passive agent request tracing. An agent harness can attach
 identity metadata to each LLM request, and Dynamo can write normalized
-`request_end` records to a local JSONL sink.
+`request_end` records to a local JSONL sink. Harness tool lifecycle events can
+also enter through a Dynamo-owned ZMQ relay and land on the same trace bus.
 
 This is observability only. It does not change routing, scheduling, or cache
 behavior.
@@ -94,9 +95,52 @@ Nullable fields are omitted when the serving path did not record them.
 }
 ```
 
+## Tool Event Relay
+
+For harness tool events, Dynamo owns the event-plane publishing path. Start
+Dynamo with a local ZMQ source endpoint:
+
+```bash
+export DYN_AGENT_TRACE_TOOL_EVENTS_ZMQ_ENDPOINT=tcp://127.0.0.1:20390
+export DYN_AGENT_TRACE_TOOL_EVENTS_ZMQ_TOPIC=
+```
+
+The ZMQ wire format is:
+
+```text
+[topic, seq_be_u64, msgpack(AgentTraceRecord)]
+```
+
+Only harness-originated `tool_start`, `tool_end`, and `tool_error` records are
+accepted. Dynamo republishes valid records onto the runtime event plane and
+then feeds them into the same in-process trace bus as request-end records.
+
+```json
+{
+  "schema": "dynamo.agent.trace.v1",
+  "event_type": "tool_end",
+  "event_time_unix_ms": 1777312801500,
+  "event_source": "harness",
+  "agent_context": {
+    "workflow_type_id": "deep_research",
+    "workflow_id": "research-run-42",
+    "program_id": "research-run-42:researcher"
+  },
+  "tool": {
+    "tool_call_id": "call-abc",
+    "tool_class": "web_search",
+    "status": "succeeded",
+    "duration_ms": 420.5,
+    "output_bytes": 2048
+  }
+}
+```
+
 ## Current Scope
 
 - `agent_context` is passive metadata.
 - Dynamo emits request-end trace records when agent tracing is enabled.
+- Tool events enter through a Dynamo-owned ZMQ relay, not through a generic
+  Python event-plane publisher.
 - JSONL is a local debug/profiling sink.
 - Future scheduler/profiler consumers should read the normalized trace bus.

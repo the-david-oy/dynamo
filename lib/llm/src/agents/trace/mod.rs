@@ -3,6 +3,7 @@
 
 pub mod config;
 mod integration;
+mod relay;
 pub mod types;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -15,12 +16,14 @@ use crate::telemetry::bus::TelemetryBus;
 use crate::telemetry::jsonl::{JsonlSinkOptions, spawn_jsonl_worker_with_shutdown};
 
 pub use config::{AgentTracePolicy, is_enabled, policy};
-pub(crate) use integration::request_metrics;
+pub(crate) use integration::{request_metrics, start_tool_event_ingest_from_policy};
+pub use relay::AgentToolEventRelay;
 pub use types::{
-    AgentRequestMetrics, AgentTraceRecord, TraceEventSource, TraceEventType, TraceSchema,
-    WorkerInfo,
+    AgentRequestMetrics, AgentToolEvent, AgentToolStatus, AgentTraceRecord, TraceEventSource,
+    TraceEventType, TraceSchema, WorkerInfo,
 };
 
+pub const DEFAULT_TOOL_EVENTS_TOPIC: &str = "agent-tool-events";
 pub(crate) const X_REQUEST_ID_CONTEXT_KEY: &str = "agent_trace.x_request_id";
 
 static BUS: TelemetryBus<AgentTraceRecord> = TelemetryBus::new();
@@ -89,7 +92,42 @@ pub fn emit_request_end(agent_context: AgentContext, request: AgentRequestMetric
         event_source: TraceEventSource::Dynamo,
         agent_context,
         request: Some(request),
+        tool: None,
     });
+}
+
+pub fn publish_tool_record(record: AgentTraceRecord) {
+    if let Err(error) = validate_tool_record(&record) {
+        tracing::warn!(
+            %error,
+            event_type = ?record.event_type,
+            "dropping invalid agent tool record"
+        );
+        return;
+    }
+    publish(record);
+}
+
+fn validate_tool_record(record: &AgentTraceRecord) -> anyhow::Result<()> {
+    if record.schema != TraceSchema::V1 {
+        anyhow::bail!("unsupported agent trace schema: {:?}", record.schema);
+    }
+    if record.event_source != TraceEventSource::Harness {
+        anyhow::bail!(
+            "agent tool records must be harness-originated, got {:?}",
+            record.event_source
+        );
+    }
+    if !record.event_type.is_tool_event() {
+        anyhow::bail!("expected tool event, got {:?}", record.event_type);
+    }
+    if record.tool.is_none() {
+        anyhow::bail!("missing tool payload");
+    }
+    if record.request.is_some() {
+        anyhow::bail!("tool event must not include request metrics");
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -103,8 +141,8 @@ mod tests {
     use crate::telemetry::jsonl::{JsonlSinkOptions, spawn_jsonl_worker_with_shutdown};
 
     use super::{
-        AgentRequestMetrics, AgentTraceRecord, BUS, TraceEventSource, TraceEventType, TraceSchema,
-        emit_request_end,
+        AgentRequestMetrics, AgentToolEvent, AgentToolStatus, AgentTraceRecord, BUS,
+        TraceEventSource, TraceEventType, TraceSchema, emit_request_end, publish_tool_record,
     };
 
     #[tokio::test]
@@ -165,14 +203,92 @@ mod tests {
         assert!(content.contains("\"request_id\":\"req-123\""));
         assert!(content.contains("\"workflow_id\":\"run-1\""));
 
-        let record: AgentTraceRecord = serde_json::from_str(content.lines().next().unwrap())
-            .expect("jsonl record should deserialize");
+        let record_line = content
+            .lines()
+            .find(|line| line.contains("\"event_type\":\"request_end\""))
+            .expect("request trace record");
+        let record: AgentTraceRecord =
+            serde_json::from_str(record_line).expect("jsonl record should deserialize");
         assert_eq!(record.schema, TraceSchema::V1);
         assert_eq!(record.event_type, TraceEventType::RequestEnd);
         assert_eq!(record.event_source, TraceEventSource::Dynamo);
         assert_eq!(
             record.request.unwrap().x_request_id.as_deref(),
             Some("llm-call-1")
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn test_agent_trace_jsonl_sink_writes_tool_record() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("agent_tool_trace.jsonl");
+        BUS.init(16);
+        let shutdown = CancellationToken::new();
+        spawn_jsonl_worker_with_shutdown(
+            BUS.subscribe(),
+            path.display().to_string(),
+            JsonlSinkOptions {
+                buffer_bytes: 128,
+                flush_interval: Duration::from_millis(10),
+            },
+            shutdown.clone(),
+        )
+        .await
+        .expect("sink should start");
+
+        publish_tool_record(AgentTraceRecord {
+            schema: TraceSchema::V1,
+            event_type: TraceEventType::ToolEnd,
+            event_time_unix_ms: 2000,
+            event_source: TraceEventSource::Harness,
+            agent_context: AgentContext {
+                workflow_type_id: "ms_agent".to_string(),
+                workflow_id: "run-1".to_string(),
+                program_id: "run-1:agent".to_string(),
+                parent_program_id: None,
+            },
+            request: None,
+            tool: Some(AgentToolEvent {
+                tool_call_id: "tool-123".to_string(),
+                tool_class: "web_search".to_string(),
+                status: Some(AgentToolStatus::Succeeded),
+                duration_ms: Some(12.5),
+                output_tokens: Some(9),
+                output_bytes: Some(64),
+                tool_name_hash: None,
+                error_type: None,
+            }),
+        });
+
+        let mut content = String::new();
+        for _ in 0..100 {
+            content = tokio::fs::read_to_string(&path).await.unwrap_or_default();
+            if content.contains("\"event_type\":\"tool_end\"")
+                && content.contains("\"tool_call_id\":\"tool-123\"")
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(content.contains("\"event_type\":\"tool_end\""));
+        assert!(content.contains("\"tool_call_id\":\"tool-123\""));
+        assert!(content.contains("\"tool_class\":\"web_search\""));
+
+        let record_line = content
+            .lines()
+            .find(|line| line.contains("\"event_type\":\"tool_end\""))
+            .expect("tool trace record");
+        let record: AgentTraceRecord =
+            serde_json::from_str(record_line).expect("jsonl record should deserialize");
+        assert_eq!(record.schema, TraceSchema::V1);
+        assert_eq!(record.event_type, TraceEventType::ToolEnd);
+        assert_eq!(record.event_source, TraceEventSource::Harness);
+        assert!(record.request.is_none());
+        assert_eq!(
+            record.tool.unwrap().status,
+            Some(AgentToolStatus::Succeeded)
         );
 
         shutdown.cancel();
