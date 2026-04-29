@@ -99,8 +99,8 @@ VLLM_MULTIMODAL_PROFILES: list[MultimodalModelProfile] = [
         extra_vllm_args=["--max-model-len", "7232"],
     ),
     MultimodalModelProfile(
-        name="google/gemma-3-4b-it",
-        short_name="gemma3-4b",
+        name="google/gemma-4-E2B",
+        short_name="gemma4-e2b",
         topologies={
             "agg": TopologyConfig(
                 marks=[pytest.mark.pre_merge],
